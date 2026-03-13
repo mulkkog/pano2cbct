@@ -7,58 +7,95 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-import wandb  # type: ignore
+import wandb
 
 from dataset.datasets import Pano2CBCT
 from model import AttUNet2Dto3D
 
 
-class Pano2CBCT_AttUNet(Dataset):
-    def __init__(self, base: Pano2CBCT, pano_in_hw=(400, 700)):
-        self.base = base
-        self.pano_in_hw = tuple(pano_in_hw)
+def norm01_np(x):
+    x = x.astype(np.float32)
+    mn = x.min()
+    mx = x.max()
+    if mx - mn < 1e-8:
+        return np.zeros_like(x)
+    return (x - mn) / (mx - mn)
 
-    def __len__(self):
-        return len(self.base)
 
-    def __getitem__(self, idx):
-        ct_norm, pano_01, prob_pano, sid = self.base[idx]
+def save_preview_png(
+    pano_2d: np.ndarray,
+    pred_3d: np.ndarray,
+    out_path: str,
+    sid: str,
+):
 
-        x = pano_01.float().unsqueeze(0).unsqueeze(0)
-        x = F.interpolate(x, size=self.pano_in_hw, mode="bilinear", align_corners=False)
-        pano_in = x[0]
+    if pano_2d.ndim != 2:
+        raise ValueError(f"Expected pano_2d shape (H,W), got {pano_2d.shape}")
+    if pred_3d.ndim != 3:
+        raise ValueError(f"Expected pred_3d shape (Z,H,W), got {pred_3d.shape}")
 
-        return pano_in, pano_01.float(), ct_norm.float(), sid
+    Z, H, W = pred_3d.shape
+    if (Z, H, W) != (120, 200, 350):
+        raise ValueError(
+            f"Model output shape changed. Expected (120, 200, 350), got {(Z,H,W)}"
+        )
+
+    mip_d = pred_3d.max(axis=0)
+    mip_h = pred_3d.max(axis=1)
+    mip_w = pred_3d.max(axis=2)
+
+    pano_vis = norm01_np(pano_2d)
+    md_vis = norm01_np(mip_d)
+    mh_vis = norm01_np(mip_h)
+    mw_vis = norm01_np(mip_w)
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4.5))
+
+    axes[0].imshow(pano_vis, cmap="gray")
+    axes[0].set_title(f"pano ({sid})")
+
+    axes[1].imshow(md_vis, cmap="gray")
+    axes[1].set_title("pred MIP@D")
+
+    axes[2].imshow(mh_vis, cmap="gray")
+    axes[2].set_title("pred MIP@H")
+
+    axes[3].imshow(mw_vis, cmap="gray")
+    axes[3].set_title("pred MIP@W")
+
+    for ax in axes:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
 
 
 def as_5d(pred):
     return pred.unsqueeze(1)
 
 
-def resize_pred_to_gt(pred, gt):
-    if pred.shape[2:] == gt.shape[2:]:
-        return pred
-    return F.interpolate(pred, size=gt.shape[2:], mode="trilinear", align_corners=False)
-
-
 def mip2d(vol, axis):
-    return torch.amax(vol, dim=axis, keepdim=False)
+    return torch.amax(vol, dim=axis)
 
 
-def mip_loss(pred, gt, axes=(2, 3, 4)):
+def mip_loss(pred, gt):
+
     s = pred.new_tensor(0.0)
-    for ax in axes:
+
+    for ax in (2, 3, 4):
         s = s + F.mse_loss(mip2d(pred, ax), mip2d(gt, ax))
-    return s / float(len(axes))
+
+    return s / 3.0
 
 
 def compute_loss(pred, gt, w_l2, w_mip):
 
     pred = as_5d(pred)
-    pred = resize_pred_to_gt(pred, gt)
 
     l2 = F.mse_loss(pred, gt)
     mip = mip_loss(pred, gt) if w_mip > 0 else pred.new_tensor(0.0)
@@ -78,14 +115,14 @@ def run_validation(model, val_dl, device, w_l2, w_mip):
     s_mip = 0
     n = 0
 
-    for pano_in, pano_01, ct_norm, sid in val_dl:
+    for pano, ct, sid in val_dl:
 
-        pano_in = pano_in.to(device)
-        ct_norm = ct_norm.to(device)
+        pano = pano.to(device)
+        ct = ct.to(device)
 
-        pred = model(pano_in)
+        pred = model(pano)
 
-        loss, l2v, mipv = compute_loss(pred, ct_norm, w_l2, w_mip)
+        loss, l2v, mipv = compute_loss(pred, ct, w_l2, w_mip)
 
         s_loss += float(loss.cpu())
         s_l2 += float(l2v.cpu())
@@ -93,98 +130,110 @@ def run_validation(model, val_dl, device, w_l2, w_mip):
 
         n += 1
 
-    if n == 0:
-        return float("inf"), float("inf"), float("inf")
-
     return s_loss / n, s_l2 / n, s_mip / n
+
+
+def make_preview(model, val_dl, device, epoch, save_dir):
+
+    model.eval()
+
+    pano, ct, sid = next(iter(val_dl))
+
+    pano = pano.to(device)
+
+    with torch.no_grad():
+        pred = model(pano)
+
+    pred = as_5d(pred)
+
+    pano_np = pano[0, 0].cpu().numpy()
+    pred_np = pred[0, 0].cpu().numpy()
+
+    sid = sid[0]
+
+    out_path = os.path.join(save_dir, f"preview_ep{epoch:03d}_{sid}.png")
+
+    save_preview_png(
+        pano_np,
+        pred_np,
+        out_path,
+        sid,
+    )
+
+    wandb.log(
+        {
+            "preview": wandb.Image(out_path),
+            "epoch": epoch,
+        },
+        step=epoch,
+    )
 
 
 def main():
 
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--cbct_root", type=str, default="/home/jijang/projects/PointSearch/mpr")
-    ap.add_argument("--pano_root", type=str, default="/home/jijang/projects/PointSearch/simpx_result")
+    ap.add_argument("--cbct_root", default="data/mpr")
+    ap.add_argument("--pano_root", default="data/pano")
 
-    ap.add_argument("--train_ids_file", type=str, default="splits/train.txt")
-    ap.add_argument("--val_ids_file", type=str, default="splits/test.txt")
-
-    ap.add_argument("--cache_dir", type=str, default=None)
+    ap.add_argument("--train_ids_file", default="splits/train.txt")
+    ap.add_argument("--val_ids_file", default="splits/test.txt")
 
     ap.add_argument("--epochs", type=int, default=200)
-    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--batch_size", type=int, default=2)
+
     ap.add_argument("--lr", type=float, default=1e-4)
-
-    ap.add_argument("--num_workers", type=int, default=2)
-
-    ap.add_argument("--save_dir", type=str, default="runs_attunet")
-    ap.add_argument("--save_every", type=int, default=5)
+    ap.add_argument("--num_workers", type=int, default=8)
 
     ap.add_argument("--w_l2", type=float, default=0.5)
     ap.add_argument("--w_mip", type=float, default=1.0)
 
+    ap.add_argument("--base_ch", type=int, default=32)
+
     ap.add_argument("--use_amp", action="store_true")
 
-    ap.add_argument("--pano_in_h", type=int, default=200)
-    ap.add_argument("--pano_in_w", type=int, default=350)
-
-    ap.add_argument("--base_ch", type=int, default=128)
+    ap.add_argument("--save_dir", default="runs")
 
     args = ap.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    wb_run = None
-    if wandb is not None:
-        wb_run = wandb.init(project="cbct2", config=vars(args))
+    wandb.init(
+        project="pano2cbct",
+        config=vars(args),
+    )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    base_train = Pano2CBCT(
-        cbct_root=args.cbct_root,
-        pano_root=args.pano_root,
-        ids_file=args.train_ids_file,
-        cache_dir=args.cache_dir,
-        return_dict=False,
-        expected_ct_shape=(120, 200, 350),
-        expected_pano_shape=(200, 350),
-        clip_low=-500.0,
-        clip_high=2500.0,
-        cache_ct=True,
+    train_ds = Pano2CBCT(
+        args.cbct_root,
+        args.pano_root,
+        args.train_ids_file,
     )
 
-    base_val = Pano2CBCT(
-        cbct_root=args.cbct_root,
-        pano_root=args.pano_root,
-        ids_file=args.val_ids_file,
-        cache_dir=args.cache_dir,
-        return_dict=False,
-        expected_ct_shape=(120, 200, 350),
-        expected_pano_shape=(200, 350),
-        clip_low=-500.0,
-        clip_high=2500.0,
-        cache_ct=True,
+    val_ds = Pano2CBCT(
+        args.cbct_root,
+        args.pano_root,
+        args.val_ids_file,
     )
-
-    ds_train = Pano2CBCT_AttUNet(base_train, pano_in_hw=(args.pano_in_h, args.pano_in_w))
-    ds_val = Pano2CBCT_AttUNet(base_val, pano_in_hw=(args.pano_in_h, args.pano_in_w))
 
     train_dl = DataLoader(
-        ds_train,
+        train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=(device == "cuda"),
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
         drop_last=True,
     )
 
     val_dl = DataLoader(
-        ds_val,
+        val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=(device == "cuda"),
-        drop_last=False,
+        num_workers=4,
+        pin_memory=True,
     )
 
     model = AttUNet2Dto3D(
@@ -193,14 +242,6 @@ def main():
     ).to(device)
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt,
-        mode="min",
-        factor=0.5,
-        patience=10,
-        min_lr=1e-6,
-    )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.use_amp and device == "cuda"))
 
@@ -214,17 +255,12 @@ def main():
         s_l2 = 0
         s_mip = 0
 
-        steps_bar = tqdm(
-            train_dl,
-            desc=f"train {ep:03d}",
-            total=len(train_dl),
-            leave=False,
-        )
+        steps_bar = tqdm(train_dl, desc=f"train {ep:03d}")
 
-        for it, (pano_in, pano_01, ct_norm, sid) in enumerate(steps_bar, start=1):
+        for it, (pano, ct, sid) in enumerate(steps_bar, start=1):
 
-            pano_in = pano_in.to(device)
-            ct_norm = ct_norm.to(device)
+            pano = pano.to(device)
+            ct = ct.to(device)
 
             opt.zero_grad(set_to_none=True)
 
@@ -232,10 +268,10 @@ def main():
 
                 with torch.cuda.amp.autocast():
 
-                    pred = model(pano_in)
+                    pred = model(pano)
 
                     loss, l2v, mipv = compute_loss(
-                        pred, ct_norm, args.w_l2, args.w_mip
+                        pred, ct, args.w_l2, args.w_mip
                     )
 
                 scaler.scale(loss).backward()
@@ -244,10 +280,10 @@ def main():
 
             else:
 
-                pred = model(pano_in)
+                pred = model(pano)
 
                 loss, l2v, mipv = compute_loss(
-                    pred, ct_norm, args.w_l2, args.w_mip
+                    pred, ct, args.w_l2, args.w_mip
                 )
 
                 loss.backward()
@@ -258,22 +294,14 @@ def main():
             s_mip += float(mipv.cpu())
 
             steps_bar.set_postfix(
-                {
-                    "loss": f"{s_loss/it:.4f}",
-                    "l2": f"{s_l2/it:.4f}",
-                    "mip": f"{s_mip/it:.4f}",
-                }
+                loss=f"{s_loss/it:.4f}",
+                l2=f"{s_l2/it:.4f}",
+                mip=f"{s_mip/it:.4f}",
             )
 
-        n = max(1, len(train_dl))
-
-        tr_loss = s_loss / n
-        tr_l2 = s_l2 / n
-        tr_mip = s_mip / n
-
-        print(
-            f"[train {ep:03d}] loss={tr_loss:.6f}  l2={tr_l2:.6f}  mip={tr_mip:.6f}"
-        )
+        tr_loss = s_loss / len(train_dl)
+        tr_l2 = s_l2 / len(train_dl)
+        tr_mip = s_mip / len(train_dl)
 
         val_loss, val_l2, val_mip = run_validation(
             model,
@@ -284,59 +312,38 @@ def main():
         )
 
         print(
+            f"[train {ep:03d}] loss={tr_loss:.6f}  l2={tr_l2:.6f}  mip={tr_mip:.6f}"
+        )
+        print(
             f"[val   {ep:03d}] loss={val_loss:.6f}  l2={val_l2:.6f}  mip={val_mip:.6f}"
         )
 
-        sched.step(val_loss)
+        wandb.log(
+            {
+                "train/loss": tr_loss,
+                "train/l2": tr_l2,
+                "train/mip": tr_mip,
+                "val/loss": val_loss,
+                "val/l2": val_l2,
+                "val/mip": val_mip,
+                "epoch": ep,
+            },
+            step=ep,
+        )
 
-        if wandb is not None:
-
-            wandb.log(
-                {
-                    "train/loss": tr_loss,
-                    "train/l2": tr_l2,
-                    "train/mip": tr_mip,
-                    "val/loss": val_loss,
-                    "val/l2": val_l2,
-                    "val/mip": val_mip,
-                    "epoch": ep,
-                    "lr": opt.param_groups[0]["lr"],
-                },
-                step=ep,
-            )
+        if ep == 1 or ep % 10 == 0:
+            make_preview(model, val_dl, device, ep, args.save_dir)
 
         if val_loss < best_val:
 
             best_val = val_loss
 
             torch.save(
-                {
-                    "epoch": ep,
-                    "best_val": best_val,
-                    "state_dict": model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "sched": sched.state_dict(),
-                },
+                model.state_dict(),
                 os.path.join(args.save_dir, "best.ckpt"),
             )
 
-        if ep % args.save_every == 0 or ep == args.epochs:
-
-            torch.save(
-                {
-                    "epoch": ep,
-                    "state_dict": model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "sched": sched.state_dict(),
-                    "best_val": best_val,
-                },
-                os.path.join(args.save_dir, f"epoch{ep:03d}.ckpt"),
-            )
-
-    print("done")
-
-    if wb_run is not None:
-        wb_run.finish()
+    wandb.finish()
 
 
 if __name__ == "__main__":
